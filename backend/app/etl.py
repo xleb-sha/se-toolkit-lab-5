@@ -9,9 +9,15 @@ Both require HTTP Basic Auth (email + password from settings).
 
 from datetime import datetime
 
+import httpx
 from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select
 
 from app.settings import settings
+from app.models.item import ItemRecord
+from app.models.learner import Learner
+from app.models.interaction import InteractionLog
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +37,13 @@ async def fetch_items() -> list[dict]:
     - Return the parsed list of dicts
     - Raise an exception if the response status is not 200
     """
-    raise NotImplementedError
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{settings.autochecker_api_url}/api/items",
+            auth=(settings.autochecker_email, settings.autochecker_password),
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 async def fetch_logs(since: datetime | None = None) -> list[dict]:
@@ -50,7 +62,34 @@ async def fetch_logs(since: datetime | None = None) -> list[dict]:
       - Use the submitted_at of the last log as the new "since" value
     - Return the combined list of all log dicts from all pages
     """
-    raise NotImplementedError
+    all_logs: list[dict] = []
+    current_since = since
+    
+    async with httpx.AsyncClient() as client:
+        while True:
+            params = {"limit": 500}
+            if current_since:
+                params["since"] = current_since.isoformat()
+            
+            response = await client.get(
+                f"{settings.autochecker_api_url}/api/logs",
+                params=params,
+                auth=(settings.autochecker_email, settings.autochecker_password),
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            logs = data.get("logs", [])
+            all_logs.extend(logs)
+            
+            # Check if there are more pages
+            if not data.get("has_more", False) or not logs:
+                break
+            
+            # Use the last log's submitted_at as the new since value
+            current_since = datetime.fromisoformat(logs[-1]["submitted_at"])
+    
+    return all_logs
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +118,66 @@ async def load_items(items: list[dict], session: AsyncSession) -> int:
     - Commit after all inserts
     - Return the number of newly created items
     """
-    raise NotImplementedError
+    created_count = 0
+    lab_mapping: dict[str, ItemRecord] = {}
+    
+    # Process labs first
+    for item in items:
+        if item.get("type") != "lab":
+            continue
+        
+        lab_title = item["title"]
+        
+        # Check if this lab already exists
+        statement = select(ItemRecord).where(
+            (ItemRecord.type == "lab") & (ItemRecord.title == lab_title)
+        )
+        result = await session.execute(statement)
+        existing = result.scalars().first()
+        
+        if existing:
+            lab_mapping[item["lab"]] = existing
+        else:
+            # Create new lab
+            lab_record = ItemRecord(type="lab", title=lab_title)
+            session.add(lab_record)
+            await session.flush()  # Flush to get the auto-generated ID
+            lab_mapping[item["lab"]] = lab_record
+            created_count += 1
+    
+    # Process tasks
+    for item in items:
+        if item.get("type") != "task":
+            continue
+        
+        task_title = item["title"]
+        lab_id = item["lab"]
+        
+        # Find parent lab
+        if lab_id not in lab_mapping:
+            continue  # Skip if parent lab not found
+        
+        parent_lab = lab_mapping[lab_id]
+        
+        # Check if this task already exists
+        statement = select(ItemRecord).where(
+            (ItemRecord.type == "task")
+            & (ItemRecord.title == task_title)
+            & (ItemRecord.parent_id == parent_lab.id)
+        )
+        result = await session.execute(statement)
+        existing = result.scalars().first()
+        
+        if not existing:
+            # Create new task
+            task_record = ItemRecord(
+                type="task", title=task_title, parent_id=parent_lab.id
+            )
+            session.add(task_record)
+            created_count += 1
+    
+    await session.commit()
+    return created_count
 
 
 async def load_logs(
@@ -121,7 +219,78 @@ async def load_logs(
     - Commit after all inserts
     - Return the number of newly created interactions
     """
-    raise NotImplementedError
+    created_count = 0
+    
+    # Build lookup from (lab, task) to item title
+    item_titles: dict[tuple[str, str | None], str] = {}
+    for item in items_catalog:
+        lab = item["lab"]
+        task = item.get("task")
+        title = item["title"]
+        item_titles[(lab, task)] = title
+    
+    for log in logs:
+        # Step 1: Find or create learner
+        student_id = log["student_id"]
+        statement = select(Learner).where(Learner.external_id == student_id)
+        result = await session.execute(statement)
+        learner = result.scalars().first()
+        
+        if not learner:
+            learner = Learner(
+                external_id=student_id,
+                student_group=log.get("group", ""),
+            )
+            session.add(learner)
+            await session.flush()
+        
+        # Step 2: Find item
+        lab_id = log["lab"]
+        task_id = log.get("task")
+        item_title = item_titles.get((lab_id, task_id))
+        
+        if not item_title:
+            continue  # Skip if no matching item
+        
+        statement = select(ItemRecord).where(ItemRecord.title == item_title)
+        result = await session.execute(statement)
+        item = result.scalars().first()
+        
+        if not item:
+            continue  # Skip if item not found
+        
+        # Step 3: Check if interaction already exists
+        external_id = log["id"]
+        statement = select(InteractionLog).where(
+            InteractionLog.external_id == external_id
+        )
+        result = await session.execute(statement)
+        existing = result.scalars().first()
+        
+        if existing:
+            continue  # Already exists, skip
+        
+        # Step 4: Create interaction log
+        try:
+            interaction = InteractionLog(
+                external_id=external_id,
+                learner_id=learner.id,
+                item_id=item.id,
+                kind="attempt",
+                score=log.get("score"),
+                checks_passed=log.get("passed"),
+                checks_total=log.get("total"),
+                created_at=datetime.fromisoformat(log["submitted_at"]),
+            )
+            session.add(interaction)
+            created_count += 1
+        except IntegrityError:
+            # Handle race conditions
+            await session.rollback()
+            continue
+    
+    await session.commit()
+    return created_count
 
 
 # ---------------------------------------------------------------------------
@@ -144,4 +313,26 @@ async def sync(session: AsyncSession) -> dict:
     - Return a dict: {"new_records": <number of new interactions>,
                       "total_records": <total interactions in DB>}
     """
-    raise NotImplementedError
+    # Step 1: Fetch and load items
+    items_catalog = await fetch_items()
+    await load_items(items_catalog, session)
+    
+    # Step 2: Determine last synced timestamp
+    statement = select(InteractionLog).order_by(InteractionLog.created_at.desc()).limit(1)
+    result = await session.execute(statement)
+    last_log = result.scalars().first()
+    since = last_log.created_at if last_log else None
+    
+    # Step 3: Fetch and load logs
+    logs = await fetch_logs(since=since)
+    new_records = await load_logs(logs, items_catalog, session)
+    
+    # Get total count
+    statement = select(InteractionLog)
+    result = await session.execute(statement)
+    total_records = len(result.scalars().all())
+    
+    return {
+        "new_records": new_records,
+        "total_records": total_records,
+    }
